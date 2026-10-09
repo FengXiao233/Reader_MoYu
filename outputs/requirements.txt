@@ -1,0 +1,5 @@
+Pillow>=11,<13
+trafilatura>=2,<3
+beautifulsoup4>=4.12,<5
+requests>=2.32,<3
+charset-normalizer>=3.4,<4

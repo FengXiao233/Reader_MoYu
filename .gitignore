@@ -1,0 +1,12 @@
+**/__pycache__/
+*.pyc
+work/.venv/
+work/build*/
+work/dist/
+work/*.spec
+work/*.json
+work/*.png
+outputs/ShiguangReader*.exe
+outputs/文本审查.exe
+outputs/cloud_server/
+outputs/cloud_server_1panel.zip
