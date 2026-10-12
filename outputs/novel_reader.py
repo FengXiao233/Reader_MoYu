@@ -293,11 +293,28 @@ def set_capture_exclusion(root: tk.Tk, enabled: bool = True) -> bool:
         return False
 
 
-def escape_key_down() -> bool:
-    """Read the physical Escape state while the reader window is withdrawn."""
+def alt_key_state() -> tuple[bool, bool]:
+    """Return whether Alt is held and whether another physical key is held."""
     try:
-        return bool(ctypes.windll.user32.GetAsyncKeyState(0x1B) & 0x8000)
+        user32 = ctypes.windll.user32
+        down = bool(user32.GetAsyncKeyState(0x12) & 0x8000)
+        if not down:
+            return False, False
+        other = any(user32.GetAsyncKeyState(code) & 0x8000
+                    for code in range(1, 255) if code not in (0x12, 0xA4, 0xA5))
+        return True, other
     except (AttributeError, OSError):
+        return False, False
+
+
+def reader_is_foreground(root: tk.Tk) -> bool:
+    try:
+        user32 = ctypes.windll.user32
+        user32.GetAncestor.argtypes = [ctypes.c_void_p, ctypes.c_uint]
+        user32.GetAncestor.restype = ctypes.c_void_p
+        user32.GetForegroundWindow.restype = ctypes.c_void_p
+        return user32.GetForegroundWindow() == user32.GetAncestor(root.winfo_id(), 2)
+    except (AttributeError, OSError, tk.TclError):
         return False
 
 
@@ -328,6 +345,14 @@ class ReaderApp:
         self.restoring_position = False
         self.auto_background = bool(self.settings.get("auto_background", True))
         self.article: Article | None = None
+        self.chapters: list[Article] = []
+        self.chapter_starts: list[str] = []
+        self.active_chapter_index = 0
+        self.prefetch_queue: queue.Queue[tuple[int, str, Article | Exception]] = queue.Queue()
+        self.prefetch_url = ""
+        self.prefetch_attempted: set[str] = set()
+        self.chapter_generation = 0
+        self._closing = False
         self.loading = False
         self.result_queue: queue.Queue[Article | Exception] = queue.Queue()
         self.drag_start: tuple[int, int, int, int] | None = None
@@ -337,9 +362,11 @@ class ReaderApp:
         self._background_after: str | None = None
         self._results_after: str | None = None
         self._resume_after: str | None = None
-        self._escape_after: str | None = None
+        self._alt_after: str | None = None
         self.hidden = False
-        self._escape_was_down = False
+        self._alt_was_down = False
+        self._alt_chord = False
+        self._alt_started_active = False
         self._shown_at = 0.0
         self.typography_panel: tk.Toplevel | None = None
         self.typography_values: dict[str, tk.IntVar] = {}
@@ -430,14 +457,13 @@ class ReaderApp:
         self.root.bind("<space>", self.page_down)
         self.root.bind("<Right>", self.next_chapter_key)
         self.root.bind("<Left>", self.previous_chapter_key)
-        self.root.bind("<Escape>", self.hide_reader)
         for widget in (self.text, self.prev_button, self.next_button, self.url_button,
                        self.close_button, self.library_button, self.typography_button,
                        self.capture_button, self.auto_button):
             widget.bind("<space>", self.page_down)
             widget.bind("<Right>", self.next_chapter_key)
             widget.bind("<Left>", self.previous_chapter_key)
-            widget.bind("<Escape>", self.hide_reader)
+        self.root.bind_all("<KeyPress>", self._note_alt_chord, add="+")
         self.root.update_idletasks()
         self.affinity_set = set_capture_exclusion(self.root) if self.auto_background else False
         self.apply_palette(self._last_color)
@@ -445,6 +471,7 @@ class ReaderApp:
             self._capture_after = self.root.after(350, self.update_background)
         self._background_after = self.root.after(2500, self._background_loop)
         self._results_after = self.root.after(80, self._poll_results)
+        self._alt_after = self.root.after(25, self._poll_alt)
         if self.last_book_key in self.books or self.current_url:
             self._resume_after = self.root.after(500, self._resume_on_start)
 
@@ -456,6 +483,8 @@ class ReaderApp:
             return {}
 
     def _save_settings(self) -> None:
+        if self._save_after:
+            self.root.after_cancel(self._save_after)
         self._save_after = None
         try:
             self._record_position()
@@ -478,6 +507,8 @@ class ReaderApp:
             pass
 
     def _save_soon(self) -> None:
+        if self._closing:
+            return
         if self._save_after:
             self.root.after_cancel(self._save_after)
         self._save_after = self.root.after(500, self._save_settings)
@@ -495,12 +526,98 @@ class ReaderApp:
 
     def _on_text_scroll(self, first: str, last: str) -> None:
         self.scroll.set(first, last)
-        if self.article and not self.restoring_position:
+        if self.chapters and not self.restoring_position:
+            self._sync_active_chapter()
+            self._maybe_prefetch_next()
             self._save_soon()
 
     def _record_position(self) -> None:
         if self.article and self.current_book_key in self.books:
-            self.books[self.current_book_key]["scroll_index"] = self.text.index("@0,0")
+            start = self.chapter_starts[self.active_chapter_index]
+            top = self.text.index("@0,0")
+            if self.text.compare(top, "<", start):
+                top = start
+            start_line = int(start.split(".")[0])
+            line, column = map(int, top.split("."))
+            self.books[self.current_book_key]["scroll_index"] = f"{line - start_line + 1}.{column}"
+
+    def _activate_chapter(self, index: int) -> None:
+        if index == self.active_chapter_index:
+            return
+        self.active_chapter_index = index
+        article = self.chapters[index]
+        self.article = article
+        self.current_url = article.url
+        self.title_label.config(text=f"  {article.title[:32]}")
+        self.url_entry.delete(0, "end")
+        self.url_entry.insert(0, article.url)
+        if self.current_book_key in self.books:
+            record = self.books[self.current_book_key]
+            record["chapter"] = article.title
+            record["url"] = article.url
+            record["updated_at"] = datetime.now().isoformat(timespec="seconds")
+            self.last_book_key = self.current_book_key
+        self.status.config(text=f"{article.title[:24]} · 进度已保存")
+
+    def _sync_active_chapter(self) -> None:
+        if not self.chapters:
+            return
+        top = self.text.index("@0,0")
+        bottom = self.text.index(f"@0,{max(0, self.text.winfo_height() - 2)}")
+        at_end = self.text.compare(bottom, ">=", "end-1c")
+        index = 0
+        for candidate in range(1, len(self.chapter_starts)):
+            start = self.chapter_starts[candidate]
+            if self.text.compare(top, ">=", start) or (at_end and self.text.compare(bottom, ">=", start)):
+                index = candidate
+        self._activate_chapter(index)
+
+    def _maybe_prefetch_next(self) -> None:
+        if not self.chapters or self.loading or self.prefetch_url:
+            return
+        latest = self.chapters[-1]
+        url = latest.next_url
+        if not url or url in self.prefetch_attempted or any(chapter.url == url for chapter in self.chapters):
+            return
+        start = self.chapter_starts[-1]
+        end = self.text.index("end-1c")
+        total = (self.text.count(start, end, "chars") or (0,))[0]
+        if total <= 0:
+            return
+        visible_bottom = self.text.index(f"@0,{max(0, self.text.winfo_height() - 2)}")
+        if self.text.compare(visible_bottom, "<", start):
+            return
+        read = (self.text.count(start, visible_bottom, "chars") or (0,))[0]
+        if read / total < 0.75:
+            return
+        self.prefetch_url = url
+        self.prefetch_attempted.add(url)
+        generation = self.chapter_generation
+
+        def worker() -> None:
+            try:
+                result: Article | Exception = fetch_article(url)
+            except Exception as error:
+                result = error
+            self.prefetch_queue.put((generation, url, result))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _append_chapter(self, article: Article) -> None:
+        top = self.text.index("@0,0")
+        self.restoring_position = True
+        self.text.config(state="normal")
+        self.text.insert("end-1c", "\n\n\n")
+        start = self.text.index("end-1c")
+        body = render_with_letter_spacing(article.text, self.letter_spacing)
+        self.text.insert("end-1c", article.title + "\n\n" + body)
+        self.text.config(state="disabled")
+        self.chapters.append(article)
+        self.chapter_starts.append(start)
+        self.text.yview(top)
+        self.restoring_position = False
+        self.status.config(text=f"已接续下一章：{article.title[:24]}")
+        self._save_soon()
 
     def _resume_on_start(self) -> None:
         if self.article or self.loading:
@@ -563,12 +680,17 @@ class ReaderApp:
         self._set_typography("font_size", self.font_size + delta)
 
     def _render_article(self, view_fraction: float | None = None) -> None:
-        if not self.article:
+        if not self.chapters:
             return
-        rendered_body = render_with_letter_spacing(self.article.text, self.letter_spacing)
         self.text.config(state="normal")
         self.text.delete("1.0", "end")
-        self.text.insert("1.0", self.article.title + "\n\n" + rendered_body)
+        self.chapter_starts = []
+        for index, article in enumerate(self.chapters):
+            if index:
+                self.text.insert("end-1c", "\n\n\n")
+            self.chapter_starts.append(self.text.index("end-1c"))
+            rendered_body = render_with_letter_spacing(article.text, self.letter_spacing)
+            self.text.insert("end-1c", article.title + "\n\n" + rendered_body)
         self.text.config(state="disabled")
         if view_fraction is not None:
             self.root.update_idletasks()
@@ -592,6 +714,7 @@ class ReaderApp:
                          spacing2=self.line_spacing, spacing3=self.paragraph_spacing)
         self._render_article(fraction)
         self.restoring_position = False
+        self._sync_active_chapter()
         labels = {"font_size": "字号", "line_spacing": "行间距",
                   "paragraph_spacing": "段间距", "letter_spacing": "字间距"}
         self.status.config(text=f"{labels[key]} {value}")
@@ -712,6 +835,28 @@ class ReaderApp:
         self.open_previous()
         return "break"
 
+    def _note_alt_chord(self, event) -> None:
+        if self._alt_was_down and event.keysym not in ("Alt_L", "Alt_R"):
+            self._alt_chord = True
+
+    def _poll_alt(self) -> None:
+        down, other_key_down = alt_key_state()
+        if down and not self._alt_was_down:
+            self._alt_started_active = self.hidden or reader_is_foreground(self.root)
+            self._alt_chord = other_key_down
+        elif down and other_key_down:
+            self._alt_chord = True
+        elif not down and self._alt_was_down:
+            if self._alt_started_active and not self._alt_chord:
+                if self.hidden:
+                    self.show_reader()
+                elif reader_is_foreground(self.root):
+                    self.hide_reader()
+            self._alt_started_active = False
+            self._alt_chord = False
+        self._alt_was_down = down
+        self._alt_after = self.root.after(25, self._poll_alt)
+
     def hide_reader(self, _event=None) -> str:
         if time.monotonic() - self._shown_at < 0.3:
             return "break"
@@ -719,33 +864,17 @@ class ReaderApp:
             self._record_position()
             self._save_soon()
             self.hidden = True
-            self._escape_was_down = True  # Wait for this keypress to be released.
             if self.affinity_set:
                 set_capture_exclusion(self.root, enabled=False)
                 self.affinity_set = False
             self.root.withdraw()
-            self._escape_after = self.root.after(25, self._poll_hidden_escape)
         return "break"
-
-    def _poll_hidden_escape(self) -> None:
-        self._escape_after = None
-        if not self.hidden:
-            return
-        down = escape_key_down()
-        if down and not self._escape_was_down:
-            self.show_reader()
-            return
-        self._escape_was_down = down
-        self._escape_after = self.root.after(25, self._poll_hidden_escape)
 
     def show_reader(self) -> None:
         if not self.hidden:
             return
         self.hidden = False
         self._shown_at = time.monotonic()
-        if self._escape_after:
-            self.root.after_cancel(self._escape_after)
-            self._escape_after = None
         self.root.deiconify()
         self.root.lift()
         self.root.attributes("-topmost", bool(self.topmost_var.get()))
@@ -765,10 +894,22 @@ class ReaderApp:
             webbrowser.open(self.current_url)
 
     def open_previous(self) -> None:
+        if self.active_chapter_index > 0:
+            index = self.active_chapter_index - 1
+            self.text.yview(self.chapter_starts[index])
+            self._activate_chapter(index)
+            self._save_soon()
+            return
         if self.article and self.article.previous_url:
             self.open_url(self.article.previous_url, book_key=self.current_book_key)
 
     def open_next(self) -> None:
+        if self.active_chapter_index + 1 < len(self.chapters):
+            index = self.active_chapter_index + 1
+            self.text.yview(self.chapter_starts[index])
+            self._activate_chapter(index)
+            self._save_soon()
+            return
         if self.article and self.article.next_url:
             self.open_url(self.article.next_url, book_key=self.current_book_key)
 
@@ -875,6 +1016,8 @@ class ReaderApp:
         url = url.strip()
         if not url:
             return
+        self.chapter_generation += 1  # Ignore a previous chapter's in-flight prefetch.
+        self.prefetch_url = ""
         self._record_position()
         self.pending_book_key = book_key
         self.pending_restore = restore
@@ -892,6 +1035,17 @@ class ReaderApp:
 
     def _poll_results(self) -> None:
         try:
+            generation, url, prefetched = self.prefetch_queue.get_nowait()
+        except queue.Empty:
+            pass
+        else:
+            if generation == self.chapter_generation and url == self.prefetch_url:
+                self.prefetch_url = ""
+                if isinstance(prefetched, Exception):
+                    self.status.config(text="下一章预加载失败，可点击下一章重试")
+                elif not any(chapter.url == prefetched.url for chapter in self.chapters):
+                    self._append_chapter(prefetched)
+        try:
             result = self.result_queue.get_nowait()
         except queue.Empty:
             pass
@@ -905,6 +1059,9 @@ class ReaderApp:
             self.status.config(text="读取失败")
             messagebox.showerror(APP_NAME, str(result), parent=self.root)
             return
+        self.chapter_generation += 1
+        self.prefetch_url = ""
+        self.prefetch_attempted.clear()
         key = self.pending_book_key or result.book_key or result.url
         previous_record = self.books.get(key, {})
         restore_index = None
@@ -912,6 +1069,9 @@ class ReaderApp:
             restore_index = previous_record.get("scroll_index")
         self.restoring_position = True
         self.article = result
+        self.chapters = [result]
+        self.chapter_starts = []
+        self.active_chapter_index = 0
         self.current_url = result.url
         self.current_book_key = key
         self.last_book_key = key
@@ -938,6 +1098,7 @@ class ReaderApp:
         self.status.config(text=f"{len(result.text):,} 字 · 进度已保存")
         self.hide_url()
         self._save_soon()
+        self._maybe_prefetch_next()
 
     def apply_palette(self, sample: tuple[int, int, int]) -> None:
         bg, fg, muted = readable_palette(sample)
@@ -974,8 +1135,9 @@ class ReaderApp:
         self._background_after = self.root.after(2500, self._background_loop)
 
     def close(self) -> None:
+        self._closing = True
         for callback_id in (self._save_after, self._capture_after, self._background_after,
-                            self._results_after, self._resume_after, self._escape_after):
+                            self._results_after, self._resume_after, self._alt_after):
             if callback_id:
                 self.root.after_cancel(callback_id)
         self._save_settings()

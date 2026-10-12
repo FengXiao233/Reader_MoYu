@@ -90,6 +90,7 @@ class ReaderTests(unittest.TestCase):
     def test_saved_chapter_and_scroll_position_restored(self):
         with tempfile.TemporaryDirectory() as folder, patch.object(reader, "SETTINGS_PATH", Path(folder) / "settings.json"):
             article = reader.extract_article(HTML, "https://example.com/book/alpha/001", "utf-8")
+            article.next_url = None
             first = reader.ReaderApp()
             try:
                 first._finish_load(article)
@@ -180,9 +181,10 @@ class ReaderTests(unittest.TestCase):
             finally:
                 app.close()
 
-    def test_reading_keys_and_escape_toggle(self):
+    def test_reading_keys_and_alt_toggle(self):
         with tempfile.TemporaryDirectory() as folder, patch.object(reader, "SETTINGS_PATH", Path(folder) / "settings.json"):
             article = reader.extract_article(HTML, "https://example.com/book/alpha/001", "utf-8")
+            article.next_url = None
             app = reader.ReaderApp()
             try:
                 app._finish_load(article)
@@ -201,20 +203,126 @@ class ReaderTests(unittest.TestCase):
                     self.assertTrue(app.text.bind("<Right>"))
                     self.assertTrue(app.text.bind("<Left>"))
 
-                key_state = [False]
-                with patch.object(reader, "escape_key_down", side_effect=lambda: key_state[0]):
-                    app.hide_reader()
-                    self.assertTrue(app.hidden)
-                    deadline = time.monotonic() + 0.2
+                self.assertFalse(app.root.bind("<Escape>"))
+                key_state = [(False, False)]
+                with patch.object(reader, "alt_key_state", side_effect=lambda: key_state[0]), patch.object(reader, "reader_is_foreground", return_value=True):
+                    key_state[0] = (True, False)
+                    deadline = time.monotonic() + 0.08
                     while time.monotonic() < deadline:
                         app.root.update()
                         time.sleep(0.01)
-                    key_state[0] = True
-                    deadline = time.monotonic() + 1
+                    self.assertFalse(app.hidden)
+                    key_state[0] = (False, False)
+                    deadline = time.monotonic() + 0.3
+                    while not app.hidden and time.monotonic() < deadline:
+                        app.root.update()
+                        time.sleep(0.01)
+                    self.assertTrue(app.hidden)
+                    key_state[0] = (True, False)
+                    deadline = time.monotonic() + 0.08
+                    while time.monotonic() < deadline:
+                        app.root.update()
+                        time.sleep(0.01)
+                    key_state[0] = (False, False)
+                    deadline = time.monotonic() + 0.3
                     while app.hidden and time.monotonic() < deadline:
                         app.root.update()
                         time.sleep(0.01)
                     self.assertFalse(app.hidden)
+                    key_state[0] = (True, False)
+                    deadline = time.monotonic() + 0.08
+                    while time.monotonic() < deadline:
+                        app.root.update()
+                        time.sleep(0.01)
+                    key_state[0] = (True, True)
+                    deadline = time.monotonic() + 0.08
+                    while time.monotonic() < deadline:
+                        app.root.update()
+                        time.sleep(0.01)
+                    key_state[0] = (False, False)
+                    deadline = time.monotonic() + 0.08
+                    while time.monotonic() < deadline:
+                        app.root.update()
+                        time.sleep(0.01)
+                    self.assertFalse(app.hidden)
+            finally:
+                app.close()
+
+    def test_next_chapter_appends_at_75_percent_and_saves_its_own_progress(self):
+        with tempfile.TemporaryDirectory() as folder, patch.object(reader, "SETTINGS_PATH", Path(folder) / "settings.json"):
+            first = reader.Article("第一章", ("第一章正文内容。" * 75 + "\n\n") * 20,
+                                   "https://example.com/book/alpha/001",
+                                   next_url="https://example.com/book/alpha/002",
+                                   book_key="https://example.com/book/alpha", book_name="测试小说")
+            second = reader.Article("第二章", ("第二章正文内容。" * 75 + "\n\n") * 20,
+                                    first.next_url, previous_url=first.url,
+                                    book_key=first.book_key, book_name=first.book_name)
+            app = reader.ReaderApp()
+            try:
+                with patch.object(reader, "fetch_article", return_value=second) as fetch:
+                    app._finish_load(first)
+                    app.root.update()
+                    self.assertEqual(fetch.call_count, 0)
+                    app.text.yview_moveto(1.0)
+                    deadline = time.monotonic() + 2
+                    while len(app.chapters) < 2 and time.monotonic() < deadline:
+                        app.root.update()
+                        time.sleep(0.01)
+                    self.assertEqual(len(app.chapters), 2)
+                    self.assertEqual(fetch.call_count, 1)
+                content = app.text.get("1.0", "end")
+                self.assertLess(content.index("第一章"), content.index("第二章"))
+                self.assertEqual(app.current_url, first.url)
+                app.open_next()
+                app.root.update()
+                self.assertEqual(app.current_url, second.url)
+                app.text.yview_moveto(1.0)
+                app.root.update()
+                app._save_settings()
+                saved = json.loads(reader.SETTINGS_PATH.read_text(encoding="utf-8"))
+                self.assertEqual(saved["books"][first.book_key]["url"], second.url)
+                self.assertNotEqual(saved["books"][first.book_key]["scroll_index"], "1.0")
+                app._set_typography("font_size", 14)
+                self.assertIn("第二章", app.text.get("1.0", "end"))
+            finally:
+                app.close()
+
+            reopened = reader.ReaderApp()
+            try:
+                reopened.pending_book_key = first.book_key
+                reopened.pending_restore = True
+                reopened._finish_load(second)
+                reopened.root.update()
+                self.assertEqual(reopened.current_url, second.url)
+                self.assertGreater(reopened.text.yview()[0], 0.2)
+            finally:
+                reopened.close()
+
+    def test_continuous_reading_prefetches_subsequent_chapters(self):
+        with tempfile.TemporaryDirectory() as folder, patch.object(reader, "SETTINGS_PATH", Path(folder) / "settings.json"):
+            key = "https://example.com/book/alpha"
+            chapters = [reader.Article(f"第{i}章", (f"第{i}章正文。" * 75 + "\n\n") * 20,
+                                       f"{key}/{i:03}", book_key=key, book_name="测试小说")
+                        for i in (1, 2, 3)]
+            chapters[0].next_url = chapters[1].url
+            chapters[1].next_url = chapters[2].url
+            app = reader.ReaderApp()
+            try:
+                with patch.object(reader, "fetch_article", side_effect=chapters[1:]) as fetch:
+                    app._finish_load(chapters[0])
+                    app.root.update()
+                    for expected in (2, 3):
+                        app.text.yview_moveto(1.0)
+                        deadline = time.monotonic() + 2
+                        while len(app.chapters) < expected and time.monotonic() < deadline:
+                            app.root.update()
+                            time.sleep(0.01)
+                        self.assertEqual(len(app.chapters), expected)
+                        if expected == 2:
+                            app.open_next()
+                            app.root.update()
+                    self.assertEqual(fetch.call_count, 2)
+                    self.assertEqual([chapter.title for chapter in app.chapters], ["第1章", "第2章", "第3章"])
             finally:
                 app.close()
 
